@@ -576,7 +576,7 @@ ObSortOpImpl::ObSortOpImpl(ObMonitorNode &op_monitor_info)
     io_event_observer_(nullptr), buckets_(NULL), max_bucket_cnt_(0), part_hash_nodes_(NULL),
     max_node_cnt_(0), part_cnt_(0), topn_cnt_(INT64_MAX), outputted_rows_cnt_(0),
     is_fetch_with_ties_(false), topn_heap_(NULL), ties_array_pos_(0), ties_array_(),
-    last_ties_row_(NULL), rows_(NULL)
+    last_ties_row_(NULL), rows_(NULL), self_sharp_filter_()
 {
 }
 
@@ -646,8 +646,9 @@ int ObSortOpImpl::init(
         default_block_size))) {
       LOG_WARN("init row store failed", K(ret));
     } else if (is_topn_sort()
-               && OB_ISNULL(topn_heap_ = OB_NEWx(TopnHeap, (&mem_context_->get_malloc_allocator()),
-                            comp_, &mem_context_->get_malloc_allocator()))) {
+               && (OB_ISNULL(topn_heap_ = OB_NEWx(TopnHeap, (&mem_context_->get_malloc_allocator()),
+                              comp_, &mem_context_->get_malloc_allocator()))
+                   || OB_FAIL(self_sharp_filter_.init(mem_context_, comp_)))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
       LOG_WARN("allocate memory failed", K(ret));
     } else if (batch_size > 0
@@ -734,6 +735,7 @@ void ObSortOpImpl::reuse()
     }
     topn_heap_->reset();
   }
+  self_sharp_filter_.reuse(mem_context_);
 }
 
 void ObSortOpImpl::unregister_profile()
@@ -806,6 +808,7 @@ void ObSortOpImpl::reset()
       mem_context_->get_malloc_allocator().free(topn_heap_);
       topn_heap_ = NULL;
     }
+    self_sharp_filter_.reset(mem_context_);
     if (NULL != last_ties_row_) {
       mem_context_->get_malloc_allocator().free(last_ties_row_);
       last_ties_row_ = NULL;
@@ -1065,7 +1068,12 @@ int ObSortOpImpl::after_add_row(ObChunkDatumStore::StoredRow *sr)
     }
   }
   if (OB_SUCC(ret)) {
-    if (OB_FAIL(rows_->push_back(sr))) {
+    SortStoredRow *new_row = static_cast<SortStoredRow *>(sr);
+    bool res = false;
+    if (OB_FAIL(self_sharp_filter_.filter(new_row, comp_, res))) {
+      LOG_WARN("failed to filter row", K(ret));
+    } else if (res) {
+    } else if (OB_FAIL(rows_->push_back(sr))) {
       LOG_WARN("array push back failed", K(ret), K(rows_->count()));
     }
   }
@@ -1443,6 +1451,21 @@ int ObSortOpImpl::do_dump()
       };
       if (OB_FAIL(build_chunk(level, input))) {
         LOG_WARN("build chunk failed", K(ret));
+      }
+    }
+
+    // init filter
+    if (OB_SUCC(ret) && is_topn_sort()) {
+      self_sharp_filter_.cal_hyper_params(rows_->count());
+
+      if (self_sharp_filter_.is_inited()) {
+        for (int64_t i = 0; i < rows_->count(); ++i) {
+          SortStoredRow *row = static_cast<SortStoredRow *>(rows_->at(i));
+          self_sharp_filter_.update_filter(row, mem_context_, sql_mem_processor_, 
+                                           comp_, inmem_row_size_);
+        }
+      } else {
+        LOG_WARN("self_sharp_filter_ is not inited");
       }
     }
 
@@ -2112,7 +2135,7 @@ int ObSortOpImpl::adjust_topn_heap_with_ties(const common::ObIArray<ObExpr*> &ex
         store_row = new_row;
         LOG_DEBUG("in memory topn sort with ties add ties array", KPC(new_row));
       }
-    } else if (OB_FAIL(generate_new_row(pre_heap_top_row, alloc, copy_pre_heap_top_row))) {
+    } else if (OB_FAIL(generate_new_row(pre_heap_top_row, alloc, copy_pre_heap_top_row, inmem_row_size_, sql_mem_processor_))) {
       LOG_WARN("failed to generate new row", K(ret));
     } else if (OB_FAIL(copy_to_topn_row(exprs, alloc, new_row))) {
       LOG_WARN("failed to generate new row", K(ret));
@@ -2229,7 +2252,9 @@ int ObSortOpImpl::copy_to_row(const common::ObIArray<ObExpr*> &exprs,
 //deep copy orign_row use the alloc
 int ObSortOpImpl::generate_new_row(SortStoredRow *orign_row,
                                    ObIAllocator &alloc,
-                                   SortStoredRow *&new_row)
+                                   SortStoredRow *&new_row,
+                                   int64_t &inmem_row_size,
+                                   ObSqlMemMgrProcessor &sql_mem_processor)
 {
   int ret = OB_SUCCESS;
   new_row = NULL;
@@ -2247,8 +2272,8 @@ int ObSortOpImpl::generate_new_row(SortStoredRow *orign_row,
     LOG_WARN("stored row assign failed", K(ret));
   } else {
     new_row->set_max_size(orign_row->get_max_size());
-    sql_mem_processor_.alloc(new_row->get_max_size());
-    inmem_row_size_ += new_row->get_max_size();
+    sql_mem_processor.alloc(new_row->get_max_size());
+    inmem_row_size += new_row->get_max_size();
   }
   return ret;
 }
@@ -2328,6 +2353,164 @@ void ObSortOpImpl::set_blk_holder(ObChunkDatumStore::IteratedBlockHolder *blk_ho
   DLIST_FOREACH_NORET(chunk, sort_chunks_) {
     chunk->iter_.set_blk_holder_ptr(blk_holder);
   }
+}
+
+ObSortOpImpl::SelfSharpFilter::SelfSharpFilter() : filter_(NULL), dump_num_(0),
+    per_bucket_num_(0), bucket_num_(0), try_cal_params_(false)
+{
+}
+
+int ObSortOpImpl::SelfSharpFilter::init(lib::MemoryContext &mem_context, Compare &comp)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(mem_context)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("mem_context is not initialized", K(ret));
+  } else if (!comp.is_inited()) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("comp is not initialized", K(ret));
+  } else if (OB_ISNULL(filter_ = OB_NEWx(Filter, (&mem_context->get_malloc_allocator()),
+                            comp, &mem_context->get_malloc_allocator()))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("allocate memory failed", K(ret));
+  } else {
+    dump_num_ = 0;
+    per_bucket_num_ = 0;
+    bucket_num_ = 0;
+    try_cal_params_ = false;
+  }
+
+  return ret;
+}
+
+void ObSortOpImpl::SelfSharpFilter::cal_hyper_params(const uint64_t rows_limit)
+{
+  // If it has been called before, there is not enough memory to use an additional filter
+  // So there is no need to use filter
+  if (!try_cal_params_) {
+    try_cal_params_ = true;
+    bucket_num_ = min(static_cast<int64_t>(floor(rows_limit * FILTER_MEM_RATIO)), MAX_BUCKET_NUM);
+        
+    // if the number of buckets is very small (e.g. 1), then this optimization is unnecessary
+    bucket_num_ = bucket_num_ < MIN_BUCKET_NUM ? 0 : bucket_num_;
+
+    if (bucket_num_ != 0) {
+      per_bucket_num_ = static_cast<uint64_t>(ceil(rows_limit / bucket_num_));
+    } else {
+      LOG_INFO("no need to use filter", K(rows_limit));
+    }
+  } else {
+    LOG_INFO("'filter init' has already failed", K(rows_limit));
+  }
+}
+
+int ObSortOpImpl::SelfSharpFilter::filter(const SortStoredRow *new_row, Compare &comp, bool &res)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(new_row)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null", K(ret));
+  } else if (!comp.is_inited()) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("comp is not initialized", K(ret));
+  } else if (!is_inited()) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("is not initialized", K(ret));
+  } else if (filter_->count() < bucket_num_) {
+    res = false;
+  } else {
+    res = comp(filter_->top(), new_row);
+  }
+
+  return ret;
+}
+
+int ObSortOpImpl::SelfSharpFilter::update_filter(SortStoredRow *dump_row, 
+                                                 lib::MemoryContext &mem_context, 
+                                                 ObSqlMemMgrProcessor &sql_mem_processor, 
+                                                 Compare &comp, 
+                                                 int64_t &inmem_row_size)
+{
+  int ret = OB_SUCCESS;
+
+  if (OB_ISNULL(dump_row)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null", K(ret));
+  } else if (OB_ISNULL(mem_context)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("mem_context is not initialized", K(ret));
+  } else if (!comp.is_inited()) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("comp is not initialized", K(ret));
+  } else if (!is_inited()) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("is not initialized", K(ret));
+  } else if ((dump_num_ + 1) % per_bucket_num_ == 0) {
+    bool need_update = false;
+    SortStoredRow *top = NULL;
+    if (filter_->count() < bucket_num_) {
+      need_update = true;
+    } else {
+      top = static_cast<SortStoredRow *>(filter_->top());
+      if (comp(dump_row, top)) {
+        need_update = true;
+      }
+    }
+
+    if (need_update) {
+      SortStoredRow *row = NULL;
+      if (OB_FAIL(generate_new_row(dump_row, mem_context->get_malloc_allocator(), row, inmem_row_size, sql_mem_processor))) {
+        LOG_WARN("failed to generate new row", K(ret));
+      } else {
+        SortStoredRow **useless_row = NULL;
+        if (filter_->count() < bucket_num_) {
+          if (OB_FAIL(filter_->push(row))) {
+            useless_row = &row;
+            LOG_WARN("failed to push back row", K(ret));
+          }
+        } else {
+          if (OB_FAIL(filter_->replace_top(row))) {
+            useless_row = &row;
+            LOG_WARN("failed to replace top", K(ret));
+          } else {
+            useless_row = &top;
+          }
+        }
+
+        if (OB_NOT_NULL(useless_row)) {
+          sql_mem_processor.alloc(-1 * (*useless_row)->get_max_size());
+          mem_context->get_malloc_allocator().free(*useless_row);
+          *useless_row = NULL;
+          useless_row = NULL;
+        }
+      }
+    }
+  }
+
+  dump_num_++;
+  return ret;
+}
+
+void ObSortOpImpl::SelfSharpFilter::reset(lib::MemoryContext &mem_context)
+{
+  if (NULL != filter_) {
+    for (int64_t i = 0; i < filter_->count(); ++i) {
+      mem_context->get_malloc_allocator().free(static_cast<SortStoredRow *>(filter_->at(i)));
+      filter_->at(i) = NULL;
+    }
+    filter_->~Filter();
+    mem_context->get_malloc_allocator().free(filter_);
+    filter_ = NULL;
+  }
+  dump_num_ = 0;
+  per_bucket_num_ = 0;
+  bucket_num_ = 0;
+  try_cal_params_ = false;
+}
+
+void ObSortOpImpl::SelfSharpFilter::reuse(lib::MemoryContext &mem_context)
+{
+  reset(mem_context);
 }
 
 /************************************* end ObSortOpImpl ********************************/
